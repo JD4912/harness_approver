@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in · Harness Approvals</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="login-page">
+  <main class="login-card">
+    <p class="eyebrow">HARNESS APPROVALS</p>
+    <h1>Sign in</h1>
+    {% if dev_login %}
+    <p>Development-only local sign-in is enabled.</p>
+    <form method="post" action="/dev-login">
+      <input type="hidden" name="csrf_token" value="{{ request.session.get('csrf_token', '') }}">
+      <button class="primary" type="submit">Continue as local developer</button>
+    </form>
+    {% else %}
+    <p>Continue through your organization’s identity provider.</p>
+    <a class="button primary" href="/login">Sign in with SSO</a>
+    {% endif %}
+  </main>
+  <script>
+    const form = document.querySelector("form");
+    if (form) {
+      fetch("/login/csrf").then(r => r.json()).then(data => {
+        form.querySelector('[name="csrf_token"]').value = data.csrf_token;
+      });
+    }
+  </script>
+</body>
+</html>

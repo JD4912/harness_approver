@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Harness Deployment Approvals</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="brand-mark">H</span> Harness <span class="brand-muted">Approvals</span></div>
+    <div class="user-menu">
+      <span>{{ user.name }}</span>
+      <form method="post" action="/logout">
+        <input type="hidden" name="csrf_token" value="{{ csrf }}">
+        <button class="text-button" type="submit">Sign out</button>
+      </form>
+    </div>
+  </header>
+  <main class="container">
+    <section class="intro">
+      <p class="eyebrow">DEPLOYMENT CONTROL</p>
+      <h1>Approval queue</h1>
+      <p>Review a Harness execution before taking an approval action.</p>
+    </section>
+
+    <section class="panel lookup-panel">
+      <h2>Review an execution</h2>
+      <form id="lookup-form">
+        <label for="execution-url">Harness execution URL</label>
+        <div class="url-row">
+          <input id="execution-url" name="execution_url" type="url" placeholder="https://app.harness.io/ng/account/…" required>
+          <button class="primary" type="submit">Find approval</button>
+        </div>
+      </form>
+      <p class="hint">Only the configured Harness host is accepted. Phase 1 permits UAT actions only.</p>
+      <div id="notice" role="status" aria-live="polite"></div>
+      <article id="execution-card" class="execution-card" hidden>
+        <div class="card-heading">
+          <div><p class="eyebrow">PENDING APPROVAL</p><h3 id="pipeline-name"></h3></div>
+          <span class="badge">UAT</span>
+        </div>
+        <dl class="details-grid">
+          <div><dt>Pipeline</dt><dd id="pipeline-id"></dd></div>
+          <div><dt>Execution</dt><dd id="execution-id"></dd></div>
+          <div><dt>Triggered by</dt><dd id="triggered-by"></dd></div>
+          <div><dt>Status</dt><dd id="execution-status"></dd></div>
+          <div><dt>Service</dt><dd id="service"></dd></div>
+          <div><dt>Artifact</dt><dd id="artifact"></dd></div>
+          <div><dt>Approval</dt><dd id="approval-name"></dd></div>
+          <div><dt>Authorized approvers</dt><dd id="approvers"></dd></div>
+        </dl>
+        <p id="approval-message" class="approval-message"></p>
+        <form id="decision-form">
+          <label for="comment">Decision comment <span class="required">Required</span></label>
+          <textarea id="comment" name="comment" maxlength="2000" required placeholder="Explain your decision…"></textarea>
+          <div class="decision-actions">
+            <button class="danger" type="submit" name="action" value="reject">Reject</button>
+            <button class="primary" type="submit" name="action" value="approve">Approve</button>
+          </div>
+        </form>
+      </article>
+    </section>
+
+    <section class="panel">
+      <div class="section-heading">
+        <div><p class="eyebrow">AUDIT TRAIL</p><h2>Recent decisions</h2></div>
+        {% if "auditor" in user.roles or "admin" in user.roles %}
+        <a class="secondary-button" href="/api/audit.csv">Export CSV</a>
+        {% endif %}
+      </div>
+      {% if events %}
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>When (UTC)</th><th>Actor</th><th>Environment</th><th>Execution</th><th>Decision</th><th>Comment</th></tr></thead>
+          <tbody>
+          {% for event in events %}
+            <tr>
+              <td>{{ event.created_at }}</td><td>{{ event.actor_email }}</td><td>{{ event.environment }}</td>
+              <td>{{ event.execution_id }}</td><td><span class="decision {{ event.action }}">{{ event.action }}</span></td>
+              <td>{{ event.comment }}</td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+      <p class="empty-state">No decisions have been recorded yet.</p>
+      {% endif %}
+    </section>
+  </main>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>
