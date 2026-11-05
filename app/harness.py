@@ -1,7 +1,7 @@
 import re
 from dataclasses import asdict, dataclass
 from typing import Optional
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 import httpx
 
@@ -88,32 +88,41 @@ class HarnessClient:
         if not self.api_key:
             raise HarnessError("Harness API key is not configured.")
 
-    async def _request(self, method: str, path: str, *, params: dict, json: Optional[dict] = None):
+    async def _request(
+        self, method: str, path: str, *, params: dict, json: Optional[dict] = None,
+        account_id: Optional[str] = None,
+    ):
         headers = {"x-api-key": self.api_key, "Accept": "application/json"}
+        if account_id:
+            headers["Harness-Account"] = account_id
         last_error = None
-        for attempt in range(2):
+        attempts = 2 if method == "GET" else 1
+        for attempt in range(attempts):
             try:
                 async with httpx.AsyncClient(timeout=8.0, follow_redirects=False) as client:
                     response = await client.request(
                         method, f"{self.base_url}{path}", params=params, json=json, headers=headers
                     )
-                if response.status_code in (429, 502, 503, 504) and attempt == 0:
+                if response.status_code in (429, 502, 503, 504) and attempt + 1 < attempts:
                     continue
                 if response.status_code >= 400:
                     raise HarnessError(f"Harness API returned HTTP {response.status_code}.")
+                if not response.content:
+                    return {"http_status": response.status_code}
                 try:
                     return response.json()
                 except ValueError as exc:
                     raise HarnessError("Harness API returned an invalid JSON response.") from exc
             except httpx.TimeoutException as exc:
                 last_error = exc
-                if attempt:
+                if attempt + 1 >= attempts:
                     break
             except httpx.RequestError as exc:
                 last_error = exc
-                if attempt:
+                if attempt + 1 >= attempts:
                     break
-        raise HarnessError("Harness API request failed after retrying.") from last_error
+        suffix = " after retrying" if attempts > 1 else ""
+        raise HarnessError(f"Harness API request failed{suffix}.") from last_error
 
     @staticmethod
     def _params(ref: ExecutionRef):
@@ -128,17 +137,46 @@ class HarnessClient:
             "GET",
             f"/pipeline/api/pipelines/execution/v2/{ref.execution_id}",
             params=self._params(ref),
+            account_id=ref.account_id,
         )
 
-    async def submit_decision(self, ref: ExecutionRef, action: str, comment: str):
+    async def get_waiting_approval(self, ref: ExecutionRef, node_execution_id: str):
+        path = (
+            f"/gateway/pipeline/api/v1/orgs/{quote(ref.org_id, safe='')}"
+            f"/projects/{quote(ref.project_id, safe='')}/approvals/execution/"
+            f"{quote(ref.execution_id, safe='')}"
+        )
+        payload = await self._request(
+            "GET",
+            path,
+            params={
+                "approval_status": "WAITING",
+                "approval_type": "HarnessApproval",
+                "node_execution_id": node_execution_id,
+            },
+            account_id=ref.account_id,
+        )
+        instances = parse_approval_instances(payload)
+        matching = [
+            instance for instance in instances
+            if instance.get("node_execution_id") in (None, node_execution_id)
+        ]
+        if not matching:
+            return None
+        if len(matching) != 1:
+            raise HarnessError("Harness returned multiple waiting approval instances for this step.")
+        return matching[0]
+
+    async def submit_decision(self, ref: ExecutionRef, approval_instance_id: str, action: str, comment: str):
         if action not in ("approve", "reject"):
             raise ValueError("Action must be approve or reject.")
-        status = "APPROVED" if action == "approve" else "REJECTED"
+        api_action = "APPROVE" if action == "approve" else "REJECT"
         return await self._request(
             "POST",
-            f"/pipeline/api/pipeline/execution/{ref.execution_id}/approval",
-            params=self._params(ref),
-            json={"status": status, "comments": comment},
+            f"/gateway/pipeline/api/approvals/{quote(approval_instance_id, safe='')}/harness/activity",
+            params={"accountIdentifier": ref.account_id},
+            json={"action": api_action, "comments": comment, "approverInputs": []},
+            account_id=ref.account_id,
         )
 
 
@@ -152,19 +190,67 @@ def _walk(value):
             yield from _walk(child)
 
 
+def parse_approval_instances(payload: dict) -> list[dict]:
+    if isinstance(payload, list):
+        items = payload
+    elif isinstance(payload, dict):
+        data = payload.get("data", payload.get("content"))
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict):
+            items = data.get("content", data.get("data"))
+            if not isinstance(items, list):
+                items = [data] if data.get("id") else []
+        else:
+            items = [payload] if payload.get("id") else []
+    else:
+        items = []
+
+    instances = []
+    for item in items:
+        if not isinstance(item, dict) or not isinstance(item.get("id"), str) or not item["id"]:
+            continue
+        details = item.get("details") if isinstance(item.get("details"), dict) else {}
+        node_id = (
+            item.get("nodeExecutionId")
+            or item.get("node_execution_id")
+            or details.get("nodeExecutionId")
+            or details.get("node_execution_id")
+        )
+        instances.append({
+            "id": item["id"],
+            "node_execution_id": node_id if isinstance(node_id, str) else None,
+            "authorized_approvers": item.get("approvers", item.get("approverUsers", [])),
+        })
+    return instances
+
+
 def summarize_execution(payload: dict, ref: ExecutionRef) -> dict:
     nodes = list(_walk(payload))
-    approval = next(
-        (
-            node for node in nodes
-            if str(node.get("nodeType", node.get("type", ""))).upper() in {"APPROVAL", "APPROVAL_STAGE"}
-            or "approval" in str(node.get("stepType", "")).lower()
-        ),
-        None,
-    )
-    pending = approval is not None and str(
-        approval.get("status", approval.get("nodeStatus", ""))
-    ).upper() in {"", "RUNNING", "WAITING", "PAUSED", "IN_PROGRESS", "WAITING_APPROVAL", "APPROVAL_WAITING"}
+    approval_nodes = []
+    for node in nodes:
+        node_type = str(node.get("nodeType", "")).upper()
+        item_type = str(node.get("type", "")).upper()
+        step_type = str(node.get("stepType", "")).upper()
+        if not (
+            "APPROVAL" in node_type or "APPROVAL" in item_type or "APPROVAL" in step_type
+        ):
+            continue
+        node_execution_id = next(
+            (
+                node.get(key) for key in
+                ("nodeExecutionId", "node_execution_id", "uuid", "nodeExecutionUuid")
+                if isinstance(node.get(key), str) and node.get(key)
+            ),
+            None,
+        )
+        approval_nodes.append({
+            "node_execution_id": node_execution_id,
+            "name": str(node.get("name", node.get("identifier", "Approval"))),
+            "message": str(node.get("approvalMessage", node.get("message", ""))),
+            "authorized_approvers": node.get("approvers", node.get("approverUsers", [])),
+        })
+    approval = approval_nodes[0] if approval_nodes else None
     environment = next(
         (
             str(node.get(key))
@@ -201,16 +287,13 @@ def summarize_execution(payload: dict, ref: ExecutionRef) -> dict:
         "environment": environment,
         "status": status,
         "triggered_by": triggered_by,
-        "approval_pending": pending,
-        "approval_name": (
-            str(approval.get("name", approval.get("identifier", "Approval"))) if approval else None
-        ),
-        "approval_message": (
-            str(approval.get("approvalMessage", approval.get("message", ""))) if approval else ""
-        ),
-        "authorized_approvers": (
-            approval.get("approvers", approval.get("approverUsers", [])) if approval else []
-        ),
+        "approval_pending": False,
+        "approval_step_found": bool(approval_nodes),
+        "approval_node_execution_id": approval["node_execution_id"] if approval else None,
+        "approval_steps": approval_nodes,
+        "approval_name": approval["name"] if approval else None,
+        "approval_message": approval["message"] if approval else "",
+        "authorized_approvers": approval["authorized_approvers"] if approval else [],
         "artifact": next(
             (str(node.get(k)) for node in nodes for k in ("artifactVersion", "tag", "imagePath") if node.get(k)),
             "Unknown",

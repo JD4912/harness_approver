@@ -34,9 +34,10 @@ The local database defaults to `approvals.db`. Set `DATABASE_URL` to a PostgreSQ
 The app validates the URL origin against `HARNESS_BASE_URL` and accepts Harness CD/CI execution paths only. API calls are made to that configured origin, never to the submitted URL. It uses:
 
 - `GET /pipeline/api/pipelines/execution/v2/{planExecutionId}` with account, org, and project identifiers.
-- `POST /pipeline/api/pipeline/execution/{planExecutionId}/approval` with `status` (`APPROVED` or `REJECTED`) and `comments`.
+- `GET /gateway/pipeline/api/v1/orgs/{org}/projects/{project}/approvals/execution/{planExecutionId}` with `approval_status=WAITING`, `approval_type=HarnessApproval`, and `node_execution_id` to locate the exact waiting approval instance.
+- `POST /gateway/pipeline/api/approvals/{approvalInstanceId}/harness/activity?accountIdentifier={account}` with `action` (`APPROVE` or `REJECT`), `comments`, and `approverInputs`.
 
-Harness API payloads can vary by module and version. The execution summarizer recognizes common execution and approval fields; if it cannot identify a pending approval or UAT environment, the app fails closed. Verify these endpoints and the response shape against the target Harness tenant/version before enabling real approvals. API calls have an 8-second timeout and retry transient failures once.
+The approval-instance and activity endpoints follow Harness's public `harness-vscode-extension` API client implementation. Harness execution payloads can vary by module and version. The summarizer recognizes common execution and approval fields; if it cannot identify a unique waiting instance or UAT environment, the app fails closed. Verify the execution endpoint and response shape against the target Harness tenant/version before enabling real approvals. GET calls have an 8-second timeout and retry transient failures once; approval POSTs are not retried automatically to avoid duplicate decisions when a timeout leaves the outcome uncertain.
 
 ## Scope and safeguards
 

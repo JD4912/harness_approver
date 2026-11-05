@@ -6,6 +6,7 @@ import time
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from datetime import timezone
+from pathlib import Path
 
 from authlib.integrations.starlette_client import OAuth
 from fastapi import Depends, FastAPI, Form, HTTPException, Request
@@ -58,7 +59,8 @@ app.add_middleware(
     https_only=settings.session_https_only,
     same_site="lax",
 )
-app.mount("/static", StaticFiles(directory="app/static"), name="static")
+APP_DIR = Path(__file__).resolve().parent
+app.mount("/static", StaticFiles(directory=APP_DIR / "static"), name="static")
 _rate_buckets: dict[str, deque[float]] = defaultdict(deque)
 
 
@@ -84,7 +86,7 @@ async def rate_limit(request: Request, call_next):
     return await call_next(request)
 
 
-templates = Jinja2Templates(directory="app/templates")
+templates = Jinja2Templates(directory=APP_DIR / "templates")
 oauth = OAuth()
 if settings.app_env != "development":
     oauth.register(
@@ -125,6 +127,30 @@ def _audit(db: Session, user: User, ref, action: str, environment: str, comment:
         api_response=json.dumps(response, separators=(",", ":"), ensure_ascii=True),
     ))
     db.commit()
+
+
+async def _load_execution(client: HarnessClient, ref):
+    summary = summarize_execution(await client.get_execution(ref), ref)
+    waiting = []
+    for step in summary["approval_steps"]:
+        node_execution_id = step["node_execution_id"]
+        if not node_execution_id:
+            continue
+        instance = await client.get_waiting_approval(ref, node_execution_id)
+        if instance:
+            waiting.append((step, instance))
+    if len(waiting) > 1:
+        raise HarnessError("Multiple approval steps are waiting; this execution is ambiguous.")
+    if waiting:
+        step, instance = waiting[0]
+        summary["approval_pending"] = True
+        summary["approval_node_execution_id"] = step["node_execution_id"]
+        summary["approval_instance_id"] = instance["id"]
+        summary["approval_name"] = step["name"]
+        summary["approval_message"] = step["message"]
+        if instance["authorized_approvers"]:
+            summary["authorized_approvers"] = instance["authorized_approvers"]
+    return summary
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -186,7 +212,7 @@ async def auth_callback(request: Request):
     token = await oauth.oidc.authorize_access_token(request)
     claims = token.get("userinfo") or await oauth.oidc.parse_id_token(request, token)
     email = claims.get("email")
-    if not email or claims.get("email_verified") is False:
+    if not email or claims.get("email_verified") is not True:
         raise HTTPException(status_code=403, detail="A verified email claim is required.")
     request.session.clear()
     request.session["user"] = {
@@ -216,12 +242,17 @@ async def lookup(
     require_csrf(request, csrf_token)
     try:
         ref = parse_execution_url(execution_url)
-        payload = await HarnessClient().get_execution(ref)
-        summary = summarize_execution(payload, ref)
+        summary = await _load_execution(HarnessClient(), ref)
         if not summary["approval_pending"]:
+            if not summary["approval_step_found"]:
+                detail = "No approval step was found in the execution."
+            elif not summary["approval_node_execution_id"]:
+                detail = "Could not identify the approval step execution ID."
+            else:
+                detail = "No pending approval instance was found for this execution."
             raise HTTPException(
                 status_code=409,
-                detail="No pending approval step was found in the execution response.",
+                detail=detail,
             )
         if summary["environment"] != "UAT":
             raise HTTPException(
@@ -254,7 +285,8 @@ async def decision(
         raise HTTPException(status_code=400, detail="A comment of 1–2000 characters is required.")
     try:
         ref = parse_execution_url(execution_url)
-        execution = summarize_execution(await HarnessClient().get_execution(ref), ref)
+        client = HarnessClient()
+        execution = await _load_execution(client, ref)
         if execution["environment"] != "UAT":
             raise HTTPException(status_code=403, detail="Production approval is disabled in Phase 1.")
         if not execution["approval_pending"]:
@@ -263,7 +295,9 @@ async def decision(
         if len(harness_comment) > 2000:
             raise HTTPException(status_code=400, detail="Comment is too long after adding approver identity.")
         try:
-            api_response = await HarnessClient().submit_decision(ref, action, harness_comment)
+            api_response = await client.submit_decision(
+                ref, execution["approval_instance_id"], action, harness_comment
+            )
         except HarnessError as exc:
             _audit(
                 db, user, ref, f"{action}_failed", execution["environment"], comment,
